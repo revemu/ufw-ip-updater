@@ -56,7 +56,7 @@ async function loadConfig() {
     };
 }
 // Configuration
-const CONFIG = await loadConfig() ;
+var CONFIG ;
 
 class UFWIPUpdater {
     constructor() {
@@ -384,6 +384,7 @@ class UFWIPUpdater {
 async function main() {
     const args = process.argv.slice(2);
     const command = args[0] || 'start';
+    CONFIG = await loadConfig() ;
 
     // Check if running as root/sudo for start command
     if (command === 'start' && process.getuid && process.getuid() !== 0) {
