@@ -5,7 +5,6 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
-require('dotenv').config(quiet = true);
 
 const execAsync = promisify(exec);
 
