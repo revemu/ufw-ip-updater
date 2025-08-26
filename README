@@ -1,0 +1,48 @@
+This Node.js script will help you automatically update UFW rules for port 3306 based on the current IP of revemu.ddns.net. Here's what it does:
+Features:
+
+DNS Resolution: Resolves the current IP of revemu.ddns.net
+State Tracking: Remembers the last known IP to avoid unnecessary updates
+UFW Management: Automatically removes old rules and adds new ones
+Logging: Comprehensive logging to both console and log file
+Error Handling: Robust error handling for network and system operations
+
+Usage:
+
+Save the script as ufw-ip-updater.js
+Make it executable:
+bashchmod +x ufw-ip-updater.js
+
+Run it with sudo (required for UFW modifications):
+bashsudo node ufw-ip-updater.js
+
+Set up a cron job for automatic updates:
+bashsudo crontab -e
+Add this line to check every 5 minutes:
+bash*/5 * * * * /usr/bin/node /path/to/ufw-ip-updater.js >> /var/log/ufw-cron.log 2>&1
+
+
+What the script does:
+
+Resolves revemu.ddns.net to get current IP
+Compares with previously stored IP
+If IP changed:
+
+Removes old UFW rule
+Adds new UFW rule for port 3306
+Reloads UFW
+Updates stored state
+
+
+
+Files created:
+
+/tmp/revemu_ip_state.json - Stores last known IP
+/var/log/ufw-ip-updater.log - Activity log
+
+Security considerations:
+
+The script requires sudo privileges to modify UFW rules
+Consider restricting access to the script file
+Monitor the log files for any issues
+Test the script manually before setting up cron jobs
