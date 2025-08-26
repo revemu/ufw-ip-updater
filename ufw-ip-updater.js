@@ -9,17 +9,54 @@ require('dotenv').config(quiet = true);
 
 const execAsync = promisify(exec);
 
+class EnvLoader {
+    static async load(envPath = '.env') {
+        try {
+            const envFile = await fs.readFile(envPath, 'utf8');
+            const lines = envFile.split('\n');
+            
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (trimmedLine && !trimmedLine.startsWith('#')) {
+                    const [key, ...valueParts] = trimmedLine.split('=');
+                    if (key && valueParts.length > 0) {
+                        const value = valueParts.join('=').replace(/^["']|["']$/g, ''); // Remove quotes
+                        process.env[key.trim()] = value;
+                    }
+                }
+            }
+        } catch (error) {
+            throw new Error(`Failed to load .env file: ${error.message}`);
+        }
+    }
+}
+
+// Load environment variables
+async function loadConfig() {
+    const envPath = path.join(__dirname, '.env');
+    
+    try {
+        await EnvLoader.load(envPath);
+    } catch (error) {
+        console.error(`Error loading .env file: ${error.message}`);
+        console.error('Please create a .env file in the same directory as this script');
+        process.exit(1);
+    }
+    
+    // Configuration with environment variables and defaults
+    return {
+        hostname: process.env.HOSTNAME,
+        port: parseInt(process.env.PORT),
+        updateInterval: (parseInt(process.env.UPDATE_INTERVAL_MINUTES) || 5) * 60 * 1000,
+        stateFile: process.env.STATE_FILE,
+        logFile: process.env.LOG_FILE,
+        pidFile: process.env.PID_FILE,
+        maxLogSize: parseInt(process.env.MAX_LOG_SIZE_MB || '10') * 1024 * 1024,
+        maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5,
+    };
+}
 // Configuration
-const CONFIG = {
-    hostname: process.env.HOSTNAME,
-    port: process.env.PORT,
-    updateInterval: 5 * 60 * 1000, // 5 minutes in milliseconds
-    stateFile: process.env.STATE_FILE ,
-    logFile: process.env.LOG_FILE,
-    pidFile: process.env.PID_FILE,
-    maxLogSize: 10 * 1024 * 1024, // 10MB
-    maxLogFiles: 5
-};
+const CONFIG = await loadConfig() ;
 
 class UFWIPUpdater {
     constructor() {
