@@ -5,17 +5,18 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
+require('dotenv').config(quiet = true);
 
 const execAsync = promisify(exec);
 
 // Configuration
 const CONFIG = {
-    hostname: 'revemu.ddns.net',
-    port: 3306,
+    hostname: process.env.HOSTNAME,
+    port: process.env.PORT,
     updateInterval: 5 * 60 * 1000, // 5 minutes in milliseconds
-    stateFile: '/tmp/revemu_ip_state.json',
-    logFile: '/var/log/ufw-ip-updater.log',
-    pidFile: '/var/run/ufw-ip-updater.pid',
+    stateFile: process.env.STATE_FILE ,
+    logFile: process.env.LOG_FILE,
+    pidFile: process.env.PID_FILE,
     maxLogSize: 10 * 1024 * 1024, // 10MB
     maxLogFiles: 5
 };
