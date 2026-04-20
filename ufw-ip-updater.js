@@ -121,7 +121,12 @@ class UFWIPUpdater {
         try {
             const data = await fs.readFile(CONFIG.stateFile, 'utf8');
             this.currentState = JSON.parse(data);
-            await this.log(`Loaded previous state: IP ${this.currentState.ip}`);
+            if (this.currentState && this.currentState.ip) {
+                await this.log(`Loaded previous state: IP ${this.currentState.ip}`);
+            } else {
+                await this.log('Previous state file empty or invalid');
+                this.currentState = null;
+            }
         } catch (error) {
             await this.log('No previous state found, starting fresh');
             this.currentState = null;
@@ -215,7 +220,8 @@ class UFWIPUpdater {
                 return false;
             }
             
-            await this.log(`IP changed from ${this.currentState.ip} to ${currentIP}`);
+            const oldIP = this.currentState ? this.currentState.ip : 'none';
+            await this.log(`IP changed from ${oldIP} to ${currentIP}`);
             
             // Remove old rule if exists
             if (this.currentState && this.currentState.ip) {
