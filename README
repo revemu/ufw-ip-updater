@@ -1,48 +1,76 @@
-This Node.js script will help you automatically update UFW rules for port 3306 based on the current IP of dynamic host name. Here's what it does:
-Features:
+# UFW IP Updater for Dynamic DNS
 
-DNS Resolution: Resolves the current IP of dynamic host name
-State Tracking: Remembers the last known IP to avoid unnecessary updates
-UFW Management: Automatically removes old rules and adds new ones
-Logging: Comprehensive logging to both console and log file
-Error Handling: Robust error handling for network and system operations
+An automated Node.js daemon and utility that resolves dynamic hostnames (DDNS) and dynamically updates Ubuntu's UFW (Uncomplicated Firewall) rules for single or multiple ports.
 
-Usage:
+## Features
 
-Save the script as ufw-ip-updater.js
-Make it executable:
-bashchmod +x ufw-ip-updater.js
+- **Multi-Port Support**: Manage one or multiple ports (e.g. `3306, 80, 443, 22`).
+- **Dynamic DNS Resolution**: Resolves IPv4 dynamic hostnames automatically.
+- **State Tracking**: Caches the last known IP to avoid redundant firewall updates and reloads.
+- **Daemon & CLI Management**: Supports `start`, `stop`, `status`, and `restart` daemon commands.
+- **Log Management & Rotation**: Built-in automatic log rotation with configurable size thresholds.
 
-Run it with sudo (required for UFW modifications):
-bashsudo node ufw-ip-updater.js
+---
 
-Set up a cron job for automatic updates:
-bashsudo crontab -e
-Add this line to check every 5 minutes:
-bash*/5 * * * * /usr/bin/node /path/to/ufw-ip-updater.js >> /var/log/ufw-cron.log 2>&1
+## Configuration
 
+Copy `.env.example` to `.env`:
 
-What the script does:
+```bash
+cp .env.example .env
+```
 
-Resolves dynamic host name to get current IP
-Compares with previously stored IP
-If IP changed:
+Configure the environment variables in `.env`:
 
-Removes old UFW rule
-Adds new UFW rule for port 3306
-Reloads UFW
-Updates stored state
+```env
+# Dynamic DNS hostname to monitor (Required)
+HOSTNAME=your-dynamic-hostname.ddns.net
 
+# Multi-port configuration (comma-separated):
+PORTS=3306, 80, 443
+# OR single port (for backward compatibility):
+# PORT=3306
 
+# Check interval in minutes (Optional, default: 5)
+UPDATE_INTERVAL_MINUTES=5
 
-Files created:
+# State and log files (Optional, defaults shown below)
+STATE_FILE=/tmp/ip_state.json
+LOG_FILE=/var/log/ufw-ip-updater.log
+PID_FILE=/tmp/ufw-ip-updater.pid
 
-/tmp/ip_state.json - Stores last known IP
-/var/log/ufw-ip-updater.log - Activity log
+# Log rotation configuration
+MAX_LOG_SIZE_MB=10
+MAX_LOG_FILES=5
+```
 
-Security considerations:
+---
 
-The script requires sudo privileges to modify UFW rules
-Consider restricting access to the script file
-Monitor the log files for any issues
-Test the script manually before setting up cron jobs
+## Usage
+
+Make sure the script has execution permissions:
+
+```bash
+chmod +x ufw-ip-updater.js
+```
+
+### Daemon Commands
+
+Because modifying UFW rules requires root privileges, execute with `sudo`:
+
+```bash
+# Start background daemon
+sudo node ufw-ip-updater.js start
+
+# Check status and current active IP
+sudo node ufw-ip-updater.js status
+
+# Stop daemon
+sudo node ufw-ip-updater.js stop
+
+# Restart daemon
+sudo node ufw-ip-updater.js restart
+
+# View help
+node ufw-ip-updater.js help
+```
