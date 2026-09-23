@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const dns = require('dns').promises;
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
@@ -30,6 +30,28 @@ class EnvLoader {
     }
 }
 
+function parsePort(portStr) {
+    const trimmed = portStr.trim();
+    // Check if protocol is specified, e.g. 2222/tcp or 53/udp
+    if (trimmed.includes('/')) {
+        const [port, proto] = trimmed.split('/');
+        return { raw: trimmed, port: port.trim(), proto: proto.trim().toLowerCase() };
+    }
+    // If port contains comma e.g. "2222,3333", UFW requires proto (defaults to tcp)
+    if (trimmed.includes(',')) {
+        return { raw: trimmed, port: trimmed, proto: process.env.PROTOCOL || 'tcp' };
+    }
+    return { raw: trimmed, port: trimmed, proto: process.env.PROTOCOL || null };
+}
+
+function buildUfwCommand(action, ip, portObj) {
+    // action: 'allow' or 'delete allow'
+    if (portObj.proto) {
+        return `sudo ufw ${action} proto ${portObj.proto} from ${ip} to any port ${portObj.port}`;
+    }
+    return `sudo ufw ${action} from ${ip} to any port ${portObj.port}`;
+}
+
 // Load environment variables
 async function loadConfig() {
     const envPath = path.join(__dirname, '.env');
@@ -42,15 +64,13 @@ async function loadConfig() {
         process.exit(1);
     }
     
-    // Parse ports: supports PORTS (e.g. "3306, 80, 443") and fallback to PORT (e.g. "3306")
-    let ports = [];
-    if (process.env.PORTS) {
-        ports = process.env.PORTS.split(',')
-            .map(p => p.trim())
-            .filter(p => p.length > 0);
-    } else if (process.env.PORT) {
-        ports = [process.env.PORT.trim()];
-    }
+    // Parse ports: supports PORTS (e.g. "2222, 3333" or "2222/tcp, 53/udp") or PORT
+    const rawPorts = (process.env.PORTS || process.env.PORT || '').toString();
+    const ports = rawPorts
+        .split(',')
+        .map(p => p.trim())
+        .filter(p => p.length > 0)
+        .map(parsePort);
 
     if (!ports || ports.length === 0) {
         console.error('Error: No PORT or PORTS defined in .env file');
@@ -66,7 +86,8 @@ async function loadConfig() {
     return {
         hostname: process.env.HOSTNAME,
         ports: ports,
-        port: ports[0], // backward compatibility
+        portsDisplay: ports.map(p => p.raw).join(', '),
+        port: ports[0].port, // backward compatibility
         updateInterval: (parseInt(process.env.UPDATE_INTERVAL_MINUTES) || 5) * 60 * 1000,
         stateFile: process.env.STATE_FILE || '/tmp/ip_state.json',
         logFile: process.env.LOG_FILE || '/var/log/ufw-ip-updater.log',
@@ -159,7 +180,7 @@ class UFWIPUpdater {
             ip: ip,
             timestamp: new Date().toISOString(),
             hostname: CONFIG.hostname,
-            ports: CONFIG.ports,
+            ports: CONFIG.ports.map(p => p.raw),
             lastUpdate: Date.now()
         };
 
@@ -183,39 +204,41 @@ class UFWIPUpdater {
     }
 
     async removeOldRule(oldIP) {
-        for (const port of CONFIG.ports) {
+        for (const portObj of CONFIG.ports) {
             try {
-                await this.log(`Removing old UFW rule for ${oldIP}:${port}`);
-                const { stdout, stderr } = await execAsync(`sudo ufw delete allow from ${oldIP} to any port ${port}`);
+                const cmd = buildUfwCommand('delete allow', oldIP, portObj);
+                await this.log(`Removing old UFW rule for ${oldIP} (${portObj.raw})`);
+                const { stdout, stderr } = await execAsync(cmd);
                 
                 if (stderr && !stderr.includes('Could not delete non-existent rule')) {
                     throw new Error(stderr);
                 }
                 
-                await this.log(`Old rule for port ${port} removed successfully`);
+                await this.log(`Old rule for port ${portObj.raw} removed successfully`);
             } catch (error) {
                 if (error.message.includes('Could not delete non-existent rule')) {
-                    await this.log(`Old rule for ${oldIP}:${port} did not exist, continuing...`);
+                    await this.log(`Old rule for ${oldIP}:${portObj.raw} did not exist, continuing...`);
                 } else {
-                    throw new Error(`Failed to remove old UFW rule for port ${port}: ${error.message}`);
+                    throw new Error(`Failed to remove old UFW rule for port ${portObj.raw}: ${error.message}`);
                 }
             }
         }
     }
 
     async addNewRule(newIP) {
-        for (const port of CONFIG.ports) {
+        for (const portObj of CONFIG.ports) {
             try {
-                await this.log(`Adding new UFW rule for ${newIP}:${port}`);
-                const { stdout, stderr } = await execAsync(`sudo ufw allow from ${newIP} to any port ${port}`);
+                const cmd = buildUfwCommand('allow', newIP, portObj);
+                await this.log(`Adding new UFW rule for ${newIP} (${portObj.raw})`);
+                const { stdout, stderr } = await execAsync(cmd);
                 
                 if (stderr) {
                     throw new Error(stderr);
                 }
                 
-                await this.log(`New rule for port ${port} added successfully: ${stdout.trim()}`);
+                await this.log(`New rule for port ${portObj.raw} added successfully: ${stdout.trim()}`);
             } catch (error) {
-                throw new Error(`Failed to add new UFW rule for port ${port}: ${error.message}`);
+                throw new Error(`Failed to add new UFW rule for port ${portObj.raw}: ${error.message}`);
             }
         }
     }
@@ -310,6 +333,38 @@ class UFWIPUpdater {
         }
     }
 
+    async startBackground() {
+        // Check if already running
+        const existingPid = await this.checkIfAlreadyRunning();
+        if (existingPid) {
+            console.error(`UFW IP Updater is already running (PID: ${existingPid})`);
+            process.exit(1);
+        }
+
+        const fsSync = require('fs');
+        let outFd = 'ignore';
+        let errFd = 'ignore';
+        try {
+            outFd = fsSync.openSync(CONFIG.logFile, 'a');
+            errFd = fsSync.openSync(CONFIG.logFile, 'a');
+        } catch (error) {
+            // fallback if log file cannot be opened synchronously
+        }
+
+        const child = spawn(process.execPath, [path.resolve(__filename), '__worker'], {
+            detached: true,
+            stdio: ['ignore', outFd, errFd],
+            env: process.env
+        });
+
+        child.unref();
+
+        console.log(`UFW IP Updater daemon started in background (PID: ${child.pid})`);
+        console.log(`Monitoring: ${CONFIG.hostname} (ports: ${CONFIG.portsDisplay})`);
+        console.log(`Logs: ${CONFIG.logFile}`);
+        process.exit(0);
+    }
+
     async startDaemon() {
         // Check if already running
         const existingPid = await this.checkIfAlreadyRunning();
@@ -319,7 +374,7 @@ class UFWIPUpdater {
         }
 
         await this.log('Starting UFW IP Updater Daemon...');
-        await this.log(`Monitoring: ${CONFIG.hostname} (ports: ${CONFIG.ports.join(', ')})`);
+        await this.log(`Monitoring: ${CONFIG.hostname} (ports: ${CONFIG.portsDisplay})`);
         await this.log(`Update interval: ${CONFIG.updateInterval / 1000} seconds`);
         
         this.isRunning = true;
@@ -401,7 +456,11 @@ class UFWIPUpdater {
             console.log(`Stopping UFW IP Updater (PID: ${existingPid})...`);
             try {
                 process.kill(existingPid, 'SIGTERM');
-                console.log('Stop signal sent successfully');
+                for (let i = 0; i < 15; i++) {
+                    await new Promise(res => setTimeout(res, 200));
+                    if (!(await this.checkIfAlreadyRunning())) break;
+                }
+                console.log('Daemon stopped successfully');
             } catch (error) {
                 console.error(`Failed to stop process: ${error.message}`);
             }
@@ -417,10 +476,10 @@ async function main() {
     const command = args[0] || 'start';
     CONFIG = await loadConfig() ;
 
-    // Check if running as root/sudo for start command
-    if (command === 'start' && process.getuid && process.getuid() !== 0) {
+    // Check if running as root/sudo for start commands on POSIX systems
+    if ((command === 'start' || command === 'run' || command === '__worker') && process.getuid && process.getuid() !== 0) {
         console.error('This script must be run with sudo privileges to modify UFW rules');
-        console.error('Usage: sudo node ufw-ip-updater.js [start|stop|status|help]');
+        console.error('Usage: sudo node ufw-ip-updater.js [start|stop|status|restart|help]');
         process.exit(1);
     }
 
@@ -429,6 +488,18 @@ async function main() {
     try {
         switch (command) {
             case 'start':
+                if (args.includes('--foreground') || args.includes('-f')) {
+                    await updater.startDaemon();
+                } else {
+                    await updater.startBackground();
+                }
+                break;
+                
+            case 'run':
+                await updater.startDaemon();
+                break;
+
+            case '__worker':
                 await updater.startDaemon();
                 break;
                 
@@ -442,9 +513,8 @@ async function main() {
                 
             case 'restart':
                 await updater.stop();
-                // Wait a moment for graceful shutdown
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                await updater.startDaemon();
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                await updater.startBackground();
                 break;
                 
             case 'help':
@@ -454,17 +524,21 @@ async function main() {
 UFW IP Updater Daemon for Dynamic DNS
 
 This script runs as a daemon and automatically updates UFW firewall rules
-every 5 minutes for ${CONFIG.hostname} (ports: ${CONFIG.ports.join(', ')}).
+every 5 minutes for ${CONFIG.hostname} (ports: ${CONFIG.portsDisplay}).
 
 Usage:
-  sudo node ufw-ip-updater.js [command]
+  sudo node ufw-ip-updater.js [command] [options]
 
 Commands:
-  start     Start the daemon (default)
+  start     Start the daemon in background (releases terminal)
   stop      Stop the running daemon
   status    Show daemon status and current IP
-  restart   Stop and start the daemon
+  restart   Stop and restart the daemon
+  run       Run directly in foreground (useful for systemd/debugging)
   help      Show this help message
+
+Options:
+  --foreground, -f   Run in foreground when used with 'start'
 
 Files:
   ${CONFIG.stateFile}  - Stores the last known IP address
@@ -472,7 +546,8 @@ Files:
   ${CONFIG.pidFile}    - Process ID file
 
 Features:
-  • Multi-port support (ports: ${CONFIG.ports.join(', ')})
+  • Multi-port support (ports: ${CONFIG.portsDisplay})
+  • Detached background daemon execution
   • Automatic 5-minute update intervals
   • Log rotation (${CONFIG.maxLogSize / 1024 / 1024}MB max, ${CONFIG.maxLogFiles} files)
   • Graceful shutdown handling

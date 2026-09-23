@@ -59,17 +59,22 @@ chmod +x ufw-ip-updater.js
 Because modifying UFW rules requires root privileges, execute with `sudo`:
 
 ```bash
-# Start background daemon
+# Start daemon in background (immediately releases terminal to shell)
 sudo node ufw-ip-updater.js start
 
-# Check status and current active IP
+# Check daemon status and current active IP
 sudo node ufw-ip-updater.js status
 
-# Stop daemon
+# Stop background daemon
 sudo node ufw-ip-updater.js stop
 
-# Restart daemon
+# Restart background daemon
 sudo node ufw-ip-updater.js restart
+
+# Run in foreground (useful for systemd service or debugging)
+sudo node ufw-ip-updater.js run
+# or
+sudo node ufw-ip-updater.js start --foreground
 
 # View help
 node ufw-ip-updater.js help
