@@ -13,6 +13,7 @@ class EnvLoader {
         try {
             const envFile = await fs.readFile(envPath, 'utf8');
             const lines = envFile.split('\n');
+            const parsed = {};
             
             for (const line of lines) {
                 const trimmedLine = line.trim();
@@ -20,17 +21,20 @@ class EnvLoader {
                     const [key, ...valueParts] = trimmedLine.split('=');
                     if (key && valueParts.length > 0) {
                         const value = valueParts.join('=').replace(/^["']|["']$/g, ''); // Remove quotes
-                        process.env[key.trim()] = value;
+                        const trimmedKey = key.trim();
+                        process.env[trimmedKey] = value;
+                        parsed[trimmedKey] = value;
                     }
                 }
             }
+            return parsed;
         } catch (error) {
             throw new Error(`Failed to load .env file: ${error.message}`);
         }
     }
 }
 
-function parsePort(portStr) {
+function parsePort(portStr, defaultProto = null) {
     const trimmed = portStr.trim();
     // Check if protocol is specified, e.g. 2222/tcp or 53/udp
     if (trimmed.includes('/')) {
@@ -39,9 +43,36 @@ function parsePort(portStr) {
     }
     // If port contains comma e.g. "2222,3333", UFW requires proto (defaults to tcp)
     if (trimmed.includes(',')) {
-        return { raw: trimmed, port: trimmed, proto: process.env.PROTOCOL || 'tcp' };
+        return { raw: trimmed, port: trimmed, proto: defaultProto || process.env.PROTOCOL || 'tcp' };
     }
-    return { raw: trimmed, port: trimmed, proto: process.env.PROTOCOL || null };
+    return { raw: trimmed, port: trimmed, proto: defaultProto || process.env.PROTOCOL || null };
+}
+
+function getPortKey(portObj) {
+    if (!portObj) return '';
+    const port = (portObj.port || '').toString().trim();
+    const proto = (portObj.proto || '').toString().trim().toLowerCase();
+    return `${port}/${proto}`;
+}
+
+function parsePortsList(rawPorts, defaultProto = null) {
+    const ports = (rawPorts || '')
+        .toString()
+        .split(',')
+        .map(p => p.trim())
+        .filter(p => p.length > 0)
+        .map(p => parsePort(p, defaultProto));
+
+    const uniquePorts = [];
+    const seenKeys = new Set();
+    for (const p of ports) {
+        const key = getPortKey(p);
+        if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            uniquePorts.push(p);
+        }
+    }
+    return uniquePorts;
 }
 
 function buildUfwCommand(action, ip, portObj) {
@@ -66,11 +97,7 @@ async function loadConfig() {
     
     // Parse ports: supports PORTS (e.g. "2222, 3333" or "2222/tcp, 53/udp") or PORT
     const rawPorts = (process.env.PORTS || process.env.PORT || '').toString();
-    const ports = rawPorts
-        .split(',')
-        .map(p => p.trim())
-        .filter(p => p.length > 0)
-        .map(parsePort);
+    const ports = parsePortsList(rawPorts);
 
     if (!ports || ports.length === 0) {
         console.error('Error: No PORT or PORTS defined in .env file');
@@ -100,7 +127,18 @@ async function loadConfig() {
 var CONFIG ;
 
 class UFWIPUpdater {
-    constructor() {
+    static setConfig(config) {
+        CONFIG = config;
+    }
+
+    static getConfig() {
+        return CONFIG;
+    }
+
+    constructor(config = null) {
+        if (config) {
+            CONFIG = config;
+        }
         this.currentState = null;
         this.isRunning = false;
         this.intervalId = null;
@@ -159,12 +197,37 @@ class UFWIPUpdater {
         }
     }
 
+    async reloadConfig() {
+        const envPath = path.join(__dirname, '.env');
+        try {
+            const envVars = await EnvLoader.load(envPath);
+            const rawPorts = (envVars.PORTS !== undefined
+                ? envVars.PORTS
+                : (envVars.PORT !== undefined ? envVars.PORT : (process.env.PORTS || process.env.PORT || ''))).toString();
+            const ports = parsePortsList(rawPorts);
+
+            if (ports && ports.length > 0) {
+                CONFIG.ports = ports;
+                CONFIG.portsDisplay = ports.map(p => p.raw).join(', ');
+                CONFIG.port = ports[0].port;
+            }
+            if (envVars.HOSTNAME || process.env.HOSTNAME) {
+                CONFIG.hostname = envVars.HOSTNAME || process.env.HOSTNAME;
+            }
+        } catch (error) {
+            await this.log(`Warning: Could not reload .env file: ${error.message}`, 'WARN');
+        }
+    }
+
     async loadState() {
         try {
             const data = await fs.readFile(CONFIG.stateFile, 'utf8');
             this.currentState = JSON.parse(data);
             if (this.currentState && this.currentState.ip) {
-                await this.log(`Loaded previous state: IP ${this.currentState.ip}`);
+                const portsStr = Array.isArray(this.currentState.ports)
+                    ? this.currentState.ports.join(', ')
+                    : (this.currentState.port || 'none');
+                await this.log(`Loaded previous state: IP ${this.currentState.ip} (ports: ${portsStr})`);
             } else {
                 await this.log('Previous state file empty or invalid');
                 this.currentState = null;
@@ -173,6 +236,48 @@ class UFWIPUpdater {
             await this.log('No previous state found, starting fresh');
             this.currentState = null;
         }
+    }
+
+    getSavedPorts() {
+        if (!this.currentState) return [];
+        const rawSaved = this.currentState.ports || (this.currentState.port ? [this.currentState.port] : []);
+        const portList = Array.isArray(rawSaved) ? rawSaved : [rawSaved];
+
+        const parsedList = portList.map(p => {
+            if (typeof p === 'string' || typeof p === 'number') {
+                return parsePort(p.toString());
+            }
+            if (p && typeof p === 'object' && p.raw) {
+                return parsePort(p.raw);
+            }
+            if (p && typeof p === 'object' && p.port) {
+                return { raw: p.raw || p.port, port: p.port.toString(), proto: p.proto || null };
+            }
+            return parsePort(String(p));
+        });
+
+        const uniquePorts = [];
+        const seenKeys = new Set();
+        for (const p of parsedList) {
+            const key = getPortKey(p);
+            if (!seenKeys.has(key)) {
+                seenKeys.add(key);
+                uniquePorts.push(p);
+            }
+        }
+        return uniquePorts;
+    }
+
+    checkPortsChanged(oldPorts, currentPorts) {
+        const oldKeyMap = new Map(oldPorts.map(p => [getPortKey(p), p]));
+        const currentKeyMap = new Map(currentPorts.map(p => [getPortKey(p), p]));
+
+        const added = currentPorts.filter(p => !oldKeyMap.has(getPortKey(p)));
+        const removed = oldPorts.filter(p => !currentKeyMap.has(getPortKey(p)));
+
+        const changed = (oldPorts.length === 0 && currentPorts.length > 0) || added.length > 0 || removed.length > 0;
+
+        return { changed, added, removed };
     }
 
     async saveState(ip) {
@@ -187,7 +292,7 @@ class UFWIPUpdater {
         try {
             await fs.writeFile(CONFIG.stateFile, JSON.stringify(state, null, 2));
             this.currentState = state;
-            await this.log(`State saved: IP ${ip}`);
+            await this.log(`State saved: IP ${ip} (ports: ${CONFIG.portsDisplay})`);
         } catch (error) {
             await this.log(`Error saving state: ${error.message}`, 'ERROR');
         }
@@ -203,8 +308,9 @@ class UFWIPUpdater {
         }
     }
 
-    async removeOldRule(oldIP) {
-        for (const portObj of CONFIG.ports) {
+    async removeOldRule(oldIP, portsToRemove = null) {
+        const ports = portsToRemove || (this.currentState && this.currentState.ports ? this.getSavedPorts() : CONFIG.ports);
+        for (const portObj of ports) {
             try {
                 const cmd = buildUfwCommand('delete allow', oldIP, portObj);
                 await this.log(`Removing old UFW rule for ${oldIP} (${portObj.raw})`);
@@ -225,8 +331,8 @@ class UFWIPUpdater {
         }
     }
 
-    async addNewRule(newIP) {
-        for (const portObj of CONFIG.ports) {
+    async addNewRule(newIP, portsToAdd = CONFIG.ports) {
+        for (const portObj of portsToAdd) {
             try {
                 const cmd = buildUfwCommand('allow', newIP, portObj);
                 await this.log(`Adding new UFW rule for ${newIP} (${portObj.raw})`);
@@ -260,25 +366,49 @@ class UFWIPUpdater {
 
     async updateRule() {
         try {
+            await this.reloadConfig();
+
             const currentIP = await this.resolveHostname();
             await this.log(`Resolved ${CONFIG.hostname} to ${currentIP}`);
             
-            // Check if IP has changed
-            if (this.currentState && this.currentState.ip === currentIP) {
-                await this.log(`IP unchanged (${currentIP}), no update needed`);
+            const oldIP = this.currentState ? this.currentState.ip : null;
+            const oldPorts = this.getSavedPorts();
+            const currentPorts = CONFIG.ports;
+            
+            const ipChanged = !oldIP || (oldIP !== currentIP);
+            const { changed: portsChanged, added: addedPorts, removed: removedPorts } = this.checkPortsChanged(oldPorts, currentPorts);
+
+            // Check if both IP and ports are unchanged
+            if (!ipChanged && !portsChanged) {
+                await this.log(`IP unchanged (${currentIP}) and ports unchanged (${CONFIG.portsDisplay}), no update needed`);
                 return false;
             }
-            
-            const oldIP = this.currentState ? this.currentState.ip : 'none';
-            await this.log(`IP changed from ${oldIP} to ${currentIP}`);
-            
-            // Remove old rule if exists
-            if (this.currentState && this.currentState.ip) {
-                await this.removeOldRule(this.currentState.ip);
+
+            if (ipChanged) {
+                if (oldIP) {
+                    await this.log(`IP changed from ${oldIP} to ${currentIP}`);
+                    const portsToRemove = oldPorts.length > 0 ? oldPorts : currentPorts;
+                    await this.removeOldRule(oldIP, portsToRemove);
+                } else {
+                    await this.log(`Initial setup for ${currentIP}`);
+                }
+
+                // Add new rules for current IP with current ports
+                await this.addNewRule(currentIP, currentPorts);
+            } else {
+                // IP is unchanged, but ports changed!
+                const changeDetails = [];
+                if (addedPorts.length > 0) changeDetails.push(`added [${addedPorts.map(p => p.raw).join(', ')}]`);
+                if (removedPorts.length > 0) changeDetails.push(`removed [${removedPorts.map(p => p.raw).join(', ')}]`);
+                await this.log(`Ports changed for ${currentIP}: ${changeDetails.join(', ')}`);
+
+                if (removedPorts.length > 0) {
+                    await this.removeOldRule(currentIP, removedPorts);
+                }
+                if (addedPorts.length > 0) {
+                    await this.addNewRule(currentIP, addedPorts);
+                }
             }
-            
-            // Add new rule
-            await this.addNewRule(currentIP);
             
             // Reload UFW
             await this.reloadUFW();
@@ -286,7 +416,7 @@ class UFWIPUpdater {
             // Save new state
             await this.saveState(currentIP);
             
-            await this.log('IP update completed successfully');
+            await this.log('Firewall update completed successfully');
             return true;
             
         } catch (error) {
@@ -440,6 +570,9 @@ class UFWIPUpdater {
                 const data = await fs.readFile(CONFIG.stateFile, 'utf8');
                 const state = JSON.parse(data);
                 console.log(`Current IP: ${state.ip}`);
+                if (state.ports) {
+                    console.log(`Active Ports: ${Array.isArray(state.ports) ? state.ports.join(', ') : state.ports}`);
+                }
                 console.log(`Last Update: ${new Date(state.timestamp).toLocaleString()}`);
             } catch (error) {
                 console.log('No state information available');
