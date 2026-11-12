@@ -75,12 +75,15 @@ function parsePortsList(rawPorts, defaultProto = null) {
     return uniquePorts;
 }
 
-function buildUfwCommand(action, ip, portObj) {
+const UFW_RULE_COMMENT = 'ufw-ip-updater';
+
+function buildUfwCommand(action, ip, portObj, comment = null) {
     // action: 'allow' or 'delete allow'
+    const commentPart = (action === 'allow' && comment) ? ` comment '${comment}'` : '';
     if (portObj.proto) {
-        return `sudo ufw ${action} proto ${portObj.proto} from ${ip} to any port ${portObj.port}`;
+        return `sudo ufw ${action} proto ${portObj.proto} from ${ip} to any port ${portObj.port}${commentPart}`;
     }
-    return `sudo ufw ${action} from ${ip} to any port ${portObj.port}`;
+    return `sudo ufw ${action} from ${ip} to any port ${portObj.port}${commentPart}`;
 }
 
 // Load environment variables
@@ -116,7 +119,7 @@ async function loadConfig() {
         portsDisplay: ports.map(p => p.raw).join(', '),
         port: ports[0].port, // backward compatibility
         updateInterval: (parseInt(process.env.UPDATE_INTERVAL_MINUTES) || 5) * 60 * 1000,
-        stateFile: process.env.STATE_FILE || '/tmp/ip_state.json',
+        stateFile: process.env.STATE_FILE || '/var/lib/ufw-ip-updater/ip_state.json',
         logFile: process.env.LOG_FILE || '/var/log/ufw-ip-updater.log',
         pidFile: process.env.PID_FILE || '/tmp/ufw-ip-updater.pid',
         maxLogSize: parseInt(process.env.MAX_LOG_SIZE_MB || '10') * 1024 * 1024,
@@ -290,6 +293,7 @@ class UFWIPUpdater {
         };
 
         try {
+            await fs.mkdir(path.dirname(CONFIG.stateFile), { recursive: true });
             await fs.writeFile(CONFIG.stateFile, JSON.stringify(state, null, 2));
             this.currentState = state;
             await this.log(`State saved: IP ${ip} (ports: ${CONFIG.portsDisplay})`);
@@ -305,6 +309,37 @@ class UFWIPUpdater {
             return ip;
         } catch (error) {
             throw new Error(`Failed to resolve ${CONFIG.hostname}: ${error.message}`);
+        }
+    }
+
+    async removeAllManagedRules(comment = UFW_RULE_COMMENT) {
+        try {
+            const { stdout } = await execAsync('sudo ufw status numbered');
+            const escapedComment = comment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const commentPattern = new RegExp(`#\\s*${escapedComment}\\s*$`);
+            const ruleNumbers = [];
+
+            for (const line of stdout.split('\n')) {
+                const match = line.match(/^\[\s*(\d+)\]\s+(.+)$/);
+                if (match && commentPattern.test(match[2])) {
+                    ruleNumbers.push(parseInt(match[1], 10));
+                }
+            }
+
+            // Delete from highest rule number to lowest so remaining indices don't shift
+            ruleNumbers.sort((a, b) => b - a);
+            for (const num of ruleNumbers) {
+                await this.log(`Removing managed UFW rule #${num} (${comment})`);
+                await execAsync(`sudo ufw --force delete ${num}`);
+            }
+
+            if (ruleNumbers.length > 0) {
+                await this.log(`Removed ${ruleNumbers.length} managed UFW rule(s)`);
+            }
+            return ruleNumbers.length;
+        } catch (error) {
+            await this.log(`Warning: Could not scan/remove managed UFW rules: ${error.message}`, 'WARN');
+            return 0;
         }
     }
 
@@ -334,7 +369,7 @@ class UFWIPUpdater {
     async addNewRule(newIP, portsToAdd = CONFIG.ports) {
         for (const portObj of portsToAdd) {
             try {
-                const cmd = buildUfwCommand('allow', newIP, portObj);
+                const cmd = buildUfwCommand('allow', newIP, portObj, UFW_RULE_COMMENT);
                 await this.log(`Adding new UFW rule for ${newIP} (${portObj.raw})`);
                 const { stdout, stderr } = await execAsync(cmd);
                 
@@ -387,10 +422,17 @@ class UFWIPUpdater {
             if (ipChanged) {
                 if (oldIP) {
                     await this.log(`IP changed from ${oldIP} to ${currentIP}`);
-                    const portsToRemove = oldPorts.length > 0 ? oldPorts : currentPorts;
-                    await this.removeOldRule(oldIP, portsToRemove);
                 } else {
                     await this.log(`Initial setup for ${currentIP}`);
+                }
+
+                // Remove all previously managed rules (tagged with comment)
+                await this.removeAllManagedRules();
+
+                // Also remove any legacy untagged rule tracked in state
+                if (oldIP) {
+                    const portsToRemove = oldPorts.length > 0 ? oldPorts : currentPorts;
+                    await this.removeOldRule(oldIP, portsToRemove);
                 }
 
                 // Add new rules for current IP with current ports
